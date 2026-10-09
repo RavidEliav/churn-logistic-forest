@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 
 import pandas as pd
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
@@ -71,6 +73,18 @@ PARAM_GRIDS = {
         "clf__max_depth": [3, 4],
         "clf__subsample": [0.8, 1.0],
     },
+    "LightGBM": {
+        "clf__n_estimators": [100, 300],
+        "clf__learning_rate": [0.05, 0.1],
+        "clf__num_leaves": [15, 31],
+        "clf__min_child_samples": [20, 50],
+    },
+    "CatBoost": {
+        "clf__iterations": [300, 600],
+        "clf__learning_rate": [0.05, 0.1],
+        "clf__depth": [4, 6],
+        "clf__l2_leaf_reg": [3, 10],
+    },
 }
 
 
@@ -84,6 +98,17 @@ def build_models() -> dict[str, Pipeline]:
             random_state=RANDOM_STATE, class_weight="balanced"
         ),
         "Gradient Boosting": GradientBoostingClassifier(random_state=RANDOM_STATE),
+        # Single-threaded: GridSearchCV already runs folds in parallel
+        "LightGBM": LGBMClassifier(
+            class_weight="balanced", random_state=RANDOM_STATE, n_jobs=1, verbose=-1
+        ),
+        "CatBoost": CatBoostClassifier(
+            auto_class_weights="Balanced",
+            random_seed=RANDOM_STATE,
+            thread_count=1,
+            verbose=0,
+            allow_writing_files=False,
+        ),
     }
     preprocessor = ColumnTransformer(
         [
@@ -104,16 +129,15 @@ def fit_params(name: str, y) -> dict:
     return {}
 
 
-def saved_params() -> dict | None:
-    """Best params from a previous grid search, or None if missing or out of date."""
+def saved_params() -> dict:
+    """Best params from previous grid searches, for models whose grid is unchanged."""
     if not BEST_PARAMS_PATH.exists():
-        return None
+        return {}
     saved = json.loads(BEST_PARAMS_PATH.read_text())
-    if set(saved) != set(PARAM_GRIDS) or any(
-        saved[name]["grid"] != PARAM_GRIDS[name] for name in saved
-    ):
-        return None
-    return saved
+    return {
+        name: entry for name, entry in saved.items()
+        if name in PARAM_GRIDS and entry["grid"] == PARAM_GRIDS[name]
+    }
 
 
 def grid_search(name: str, pipe: Pipeline, X, y) -> tuple[dict, pd.DataFrame]:
@@ -147,21 +171,28 @@ def grid_search(name: str, pipe: Pipeline, X, y) -> tuple[dict, pd.DataFrame]:
     return {"params": res["params"][best], "grid": PARAM_GRIDS[name], "cv": cv}, table
 
 
-def evaluate(pipe: Pipeline, name: str, X_test, y_test) -> tuple[dict, list]:
+def default_params(pipe: Pipeline, name: str) -> dict:
+    clf = pipe.named_steps["clf"]
+    # CatBoost's get_params() only lists explicitly set params
+    params = clf.get_all_params() if isinstance(clf, CatBoostClassifier) else clf.get_params()
+    values = {k: params[k.removeprefix("clf__")] for k in PARAM_GRIDS[name]}
+    return {k: round(v, 4) if isinstance(v, float) else v for k, v in values.items()}
+
+
+def evaluate(pipe: Pipeline, X_test, y_test, params: dict) -> tuple[dict, list]:
     proba = pipe.predict_proba(X_test)[:, 1]
     pred = (proba >= 0.5).astype(int)
-    clf_params = pipe.named_steps["clf"].get_params()
     return {
         "precision": precision_score(y_test, pred, zero_division=0),
         "recall": recall_score(y_test, pred),
         "f1": f1_score(y_test, pred),
         "roc_auc": roc_auc_score(y_test, proba),
         "confusion_matrix": confusion_matrix(y_test, pred).tolist(),
-        "params": {k: clf_params[k.removeprefix("clf__")] for k in PARAM_GRIDS[name]},
+        "params": params,
     }, proba.tolist()
 
 
-def main(tune: bool = True) -> None:
+def main(tune_models: list[str] = ()) -> None:
     df = pd.read_csv(DATA_PATH)
     X, y = df.drop(columns=[TARGET]), df[TARGET]
     # Split raw data first; all preparation is fitted inside the pipeline on the 80% train set only
@@ -170,18 +201,20 @@ def main(tune: bool = True) -> None:
     )
     print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows")
 
-    best_params = None if tune else saved_params()
-    cv_tables = []
-    if best_params is None:
+    best_params = {n: p for n, p in saved_params().items() if n not in tune_models}
+    if tune_models:
         print(f"Grid search, {CV_FOLDS}-fold stratified CV on the training set "
-              f"(best by {REFIT_METRIC})")
-        best_params = {}
+              f"(best by {REFIT_METRIC}): {', '.join(tune_models)}")
+    cv_tables = []
+    if tune_models and CV_RESULTS_PATH.exists():
+        old = pd.read_csv(CV_RESULTS_PATH)
+        cv_tables.append(old[old["model"].isin(best_params)])
 
     metrics = {stage: {} for stage in STAGES}
     predictions = pd.DataFrame({"y_true": y_test.to_numpy()})
 
     for name, pipe in build_models().items():
-        if name not in best_params:
+        if name in tune_models:
             start = time.perf_counter()
             best_params[name], table = grid_search(name, pipe, X_train, y_train)
             cv_tables.append(table)
@@ -189,14 +222,18 @@ def main(tune: bool = True) -> None:
                   f"{best_params[name]['cv'][REFIT_METRIC]['mean']:.4f} "
                   f"({time.perf_counter() - start:.0f}s)")
 
-        tuned = clone(pipe).set_params(**best_params[name]["params"])
-        for stage, model in zip(STAGES, (clone(pipe), tuned)):
-            model.fit(X_train, y_train, **fit_params(name, y_train))
-            metrics[stage][name], predictions[f"{stage}|{name}"] = evaluate(
-                model, name, X_test, y_test
-            )
+        baseline = clone(pipe).fit(X_train, y_train, **fit_params(name, y_train))
+        result = evaluate(baseline, X_test, y_test, default_params(baseline, name))
+        metrics["baseline"][name], predictions[f"baseline|{name}"] = result
 
-    if cv_tables:
+        if name in best_params:
+            tuned = clone(pipe).set_params(**best_params[name]["params"])
+            tuned.fit(X_train, y_train, **fit_params(name, y_train))
+            result = evaluate(tuned, X_test, y_test, best_params[name]["params"])
+        metrics["tuned"][name], predictions[f"tuned|{name}"] = result
+        metrics["tuned"][name] = {**metrics["tuned"][name], "is_tuned": name in best_params}
+
+    if tune_models:
         TUNING_DIR.mkdir(exist_ok=True)
         BEST_PARAMS_PATH.write_text(json.dumps(best_params, indent=2))
         pd.concat(cv_tables).to_csv(CV_RESULTS_PATH, index=False)
@@ -213,6 +250,8 @@ def main(tune: bool = True) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--no-tune", action="store_true",
-                        help="reuse tuning/best_params.json instead of running the grid search")
-    main(tune=not parser.parse_args().no_tune)
+    parser.add_argument("--tune", nargs="*", choices=list(PARAM_GRIDS), metavar="MODEL",
+                        help="grid-search these models (all if none given); "
+                             "by default only saved best params are used")
+    args = parser.parse_args()
+    main(tune_models=list(PARAM_GRIDS) if args.tune == [] else args.tune or [])
