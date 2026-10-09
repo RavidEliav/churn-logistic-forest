@@ -3,8 +3,8 @@ import json
 import time
 from pathlib import Path
 
-import joblib
 import pandas as pd
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -24,6 +24,8 @@ from sklearn.utils.class_weight import compute_sample_weight
 BASE_DIR = Path(__file__).parent
 DATA_PATH = BASE_DIR / "churn_modelling.csv"
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
+METRICS_PATH = ARTIFACTS_DIR / "metrics.json"
+PREDICTIONS_PATH = ARTIFACTS_DIR / "test_predictions.csv"
 TUNING_DIR = BASE_DIR / "tuning"
 BEST_PARAMS_PATH = TUNING_DIR / "best_params.json"
 CV_RESULTS_PATH = TUNING_DIR / "cv_results.csv"
@@ -41,10 +43,9 @@ NUMERIC = [
     "EstimatedSalary",
 ]
 RANDOM_STATE = 42
-# GradientBoostingClassifier has no class_weight, so these are balanced via fit sample weights
-SAMPLE_WEIGHTED = {"Gradient Boosting (balanced)"}
+STAGES = ("baseline", "tuned")
 
-CV_FOLDS = 5
+CV_FOLDS = 10
 REFIT_METRIC = "roc_auc"
 SCORING = {
     "precision": make_scorer(precision_score, zero_division=0),
@@ -53,81 +54,54 @@ SCORING = {
     "roc_auc": "roc_auc",
 }
 
-LR_GRID = {
-    "clf__C": [0.01, 0.1, 1, 10, 100],
-    "clf__l1_ratio": [0, 1],  # 0 = L2, 1 = L1
-}
-RF_GRID = {
-    "clf__n_estimators": [200, 400],
-    "clf__max_depth": [None, 10],
-    "clf__min_samples_leaf": [1, 5],
-    "clf__max_features": ["sqrt", 0.5],
-}
-GB_GRID = {
-    "clf__n_estimators": [100, 200],
-    "clf__learning_rate": [0.05, 0.1],
-    "clf__max_depth": [3, 4],
-    "clf__subsample": [0.8, 1.0],
-}
 PARAM_GRIDS = {
-    "Logistic Regression": LR_GRID,
-    "Logistic Regression (balanced)": LR_GRID,
-    "Random Forest": RF_GRID,
-    "Random Forest (balanced)": RF_GRID,
-    "Gradient Boosting": GB_GRID,
-    "Gradient Boosting (balanced)": GB_GRID,
+    "Logistic Regression": {
+        "clf__C": [0.01, 0.1, 1, 10, 100],
+        "clf__l1_ratio": [0, 1],  # 0 = L2, 1 = L1
+    },
+    "Random Forest": {
+        "clf__n_estimators": [200, 400],
+        "clf__max_depth": [None, 10],
+        "clf__min_samples_leaf": [1, 5],
+        "clf__max_features": ["sqrt", 0.5],
+    },
+    "Gradient Boosting": {
+        "clf__n_estimators": [100, 200],
+        "clf__learning_rate": [0.05, 0.1],
+        "clf__max_depth": [3, 4],
+        "clf__subsample": [0.8, 1.0],
+    },
 }
 
 
-def build_preprocessor() -> ColumnTransformer:
-    return ColumnTransformer(
+def build_models() -> dict[str, Pipeline]:
+    """All models are balanced; GradientBoostingClassifier has no class_weight, see fit_params()."""
+    estimators = {
+        "Logistic Regression": LogisticRegression(
+            solver="liblinear", max_iter=1000, class_weight="balanced"
+        ),
+        "Random Forest": RandomForestClassifier(
+            random_state=RANDOM_STATE, class_weight="balanced"
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(random_state=RANDOM_STATE),
+    }
+    preprocessor = ColumnTransformer(
         [
             ("num", StandardScaler(), NUMERIC),
             ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL),
         ],
         remainder="drop",  # discards CustomerId and Surname
     )
-
-
-def build_models() -> dict[str, Pipeline]:
-    estimators = {
-        "Logistic Regression": LogisticRegression(solver="liblinear", max_iter=1000),
-        "Logistic Regression (balanced)": LogisticRegression(
-            solver="liblinear", max_iter=1000, class_weight="balanced"
-        ),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=300, random_state=RANDOM_STATE
-        ),
-        "Random Forest (balanced)": RandomForestClassifier(
-            n_estimators=300,
-            random_state=RANDOM_STATE,
-            class_weight="balanced",
-        ),
-        "Gradient Boosting": GradientBoostingClassifier(random_state=RANDOM_STATE),
-        "Gradient Boosting (balanced)": GradientBoostingClassifier(
-            random_state=RANDOM_STATE
-        ),
-    }
     return {
-        name: Pipeline([("prep", build_preprocessor()), ("clf", est)])
+        name: Pipeline([("prep", clone(preprocessor)), ("clf", est)])
         for name, est in estimators.items()
     }
 
 
-def slugify(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("(", "").replace(")", "")
-
-
-def feature_weights(name: str, pipe: Pipeline) -> pd.DataFrame:
-    features = pipe.named_steps["prep"].get_feature_names_out()
-    clf = pipe.named_steps["clf"]
-    if isinstance(clf, LogisticRegression):
-        values, kind = clf.coef_[0], "coefficient"
-    else:
-        values, kind = clf.feature_importances_, "importance"
-    return pd.DataFrame(
-        {"model": name, "feature": features, "value": values, "kind": kind}
-    )
+def fit_params(name: str, y) -> dict:
+    if name == "Gradient Boosting":
+        return {"clf__sample_weight": compute_sample_weight("balanced", y)}
+    return {}
 
 
 def saved_params() -> dict | None:
@@ -135,49 +109,56 @@ def saved_params() -> dict | None:
     if not BEST_PARAMS_PATH.exists():
         return None
     saved = json.loads(BEST_PARAMS_PATH.read_text())
-    if set(saved) != set(build_models()) or any(
+    if set(saved) != set(PARAM_GRIDS) or any(
         saved[name]["grid"] != PARAM_GRIDS[name] for name in saved
     ):
         return None
     return saved
 
 
-def grid_search(name: str, pipe: Pipeline, X, y, fit_params: dict) -> GridSearchCV:
+def grid_search(name: str, pipe: Pipeline, X, y) -> tuple[dict, pd.DataFrame]:
     search = GridSearchCV(
         pipe,
         PARAM_GRIDS[name],
         scoring=SCORING,
-        refit=REFIT_METRIC,
+        refit=False,
         cv=StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
         n_jobs=-1,
-    )
-    return search.fit(X, y, **fit_params)
+    ).fit(X, y, **fit_params(name, y))
 
-
-def summarize_search(name: str, search: GridSearchCV) -> tuple[dict, pd.DataFrame]:
     res = search.cv_results_
-    best = search.best_index_
+    best = int(res[f"rank_test_{REFIT_METRIC}"].argmin())
     cv = {
-        metric: {
-            "mean": float(res[f"mean_test_{metric}"][best]),
-            "std": float(res[f"std_test_{metric}"][best]),
-            "folds": [float(res[f"split{k}_test_{metric}"][best]) for k in range(CV_FOLDS)],
+        m: {
+            "mean": float(res[f"mean_test_{m}"][best]),
+            "std": float(res[f"std_test_{m}"][best]),
+            "folds": [float(res[f"split{k}_test_{m}"][best]) for k in range(CV_FOLDS)],
         }
-        for metric in SCORING
+        for m in SCORING
     }
-    summary = {"params": search.best_params_, "grid": PARAM_GRIDS[name], "cv": cv}
-
     table = pd.DataFrame(
         {
             "model": name,
             "params": [json.dumps(p) for p in res["params"]],
             **{f"mean_{m}": res[f"mean_test_{m}"] for m in SCORING},
-            **{f"std_{m}": res[f"std_test_{m}"] for m in SCORING},
             "rank": res[f"rank_test_{REFIT_METRIC}"],
-            "fit_time": res["mean_fit_time"],
         }
     )
-    return summary, table
+    return {"params": res["params"][best], "grid": PARAM_GRIDS[name], "cv": cv}, table
+
+
+def evaluate(pipe: Pipeline, name: str, X_test, y_test) -> tuple[dict, list]:
+    proba = pipe.predict_proba(X_test)[:, 1]
+    pred = (proba >= 0.5).astype(int)
+    clf_params = pipe.named_steps["clf"].get_params()
+    return {
+        "precision": precision_score(y_test, pred, zero_division=0),
+        "recall": recall_score(y_test, pred),
+        "f1": f1_score(y_test, pred),
+        "roc_auc": roc_auc_score(y_test, proba),
+        "confusion_matrix": confusion_matrix(y_test, pred).tolist(),
+        "params": {k: clf_params[k.removeprefix("clf__")] for k in PARAM_GRIDS[name]},
+    }, proba.tolist()
 
 
 def main(tune: bool = True) -> None:
@@ -187,65 +168,47 @@ def main(tune: bool = True) -> None:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, train_size=0.8, stratify=y, random_state=RANDOM_STATE
     )
-    print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows\n")
+    print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows")
 
     best_params = None if tune else saved_params()
     cv_tables = []
     if best_params is None:
-        print(f"Grid search with {CV_FOLDS}-fold stratified CV on the training set "
-              f"(refit on {REFIT_METRIC})...")
+        print(f"Grid search, {CV_FOLDS}-fold stratified CV on the training set "
+              f"(best by {REFIT_METRIC})")
         best_params = {}
 
-    ARTIFACTS_DIR.mkdir(exist_ok=True)
+    metrics = {stage: {} for stage in STAGES}
     predictions = pd.DataFrame({"y_true": y_test.to_numpy()})
-    metrics, weights = {}, []
 
     for name, pipe in build_models().items():
-        fit_params = {}
-        if name in SAMPLE_WEIGHTED:
-            fit_params["clf__sample_weight"] = compute_sample_weight("balanced", y_train)
-
-        if name in best_params:
-            pipe.set_params(**best_params[name]["params"])
-            pipe.fit(X_train, y_train, **fit_params)
-        else:
+        if name not in best_params:
             start = time.perf_counter()
-            search = grid_search(name, pipe, X_train, y_train, fit_params)
-            best_params[name], table = summarize_search(name, search)
+            best_params[name], table = grid_search(name, pipe, X_train, y_train)
             cv_tables.append(table)
-            pipe = search.best_estimator_
-            print(f"  {name}: CV {REFIT_METRIC}={search.best_score_:.4f} "
-                  f"({time.perf_counter() - start:.0f}s) {search.best_params_}")
+            print(f"  {name}: CV {REFIT_METRIC}="
+                  f"{best_params[name]['cv'][REFIT_METRIC]['mean']:.4f} "
+                  f"({time.perf_counter() - start:.0f}s)")
 
-        proba = pipe.predict_proba(X_test)[:, 1]
-        pred = (proba >= 0.5).astype(int)
-
-        predictions[name] = proba
-        metrics[name] = {
-            "precision": precision_score(y_test, pred, zero_division=0),
-            "recall": recall_score(y_test, pred),
-            "f1": f1_score(y_test, pred),
-            "roc_auc": roc_auc_score(y_test, proba),
-            "confusion_matrix": confusion_matrix(y_test, pred).tolist(),
-            "params": best_params[name]["params"],
-            "file": f"{slugify(name)}.joblib",
-        }
-        weights.append(feature_weights(name, pipe))
-        joblib.dump(pipe, ARTIFACTS_DIR / metrics[name]["file"])
+        tuned = clone(pipe).set_params(**best_params[name]["params"])
+        for stage, model in zip(STAGES, (clone(pipe), tuned)):
+            model.fit(X_train, y_train, **fit_params(name, y_train))
+            metrics[stage][name], predictions[f"{stage}|{name}"] = evaluate(
+                model, name, X_test, y_test
+            )
 
     if cv_tables:
         TUNING_DIR.mkdir(exist_ok=True)
         BEST_PARAMS_PATH.write_text(json.dumps(best_params, indent=2))
         pd.concat(cv_tables).to_csv(CV_RESULTS_PATH, index=False)
 
-    predictions.to_csv(ARTIFACTS_DIR / "test_predictions.csv", index=False)
-    pd.concat(weights).to_csv(ARTIFACTS_DIR / "feature_importance.csv", index=False)
-    (ARTIFACTS_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    ARTIFACTS_DIR.mkdir(exist_ok=True)
+    METRICS_PATH.write_text(json.dumps(metrics, indent=2))
+    predictions.to_csv(PREDICTIONS_PATH, index=False)
 
-    summary = pd.DataFrame(metrics).T[["precision", "recall", "f1", "roc_auc"]]
-    print("\nTest set (threshold 0.5):")
-    print(summary.astype(float).round(4).to_string())
-    print(f"\nArtifacts saved to {ARTIFACTS_DIR}")
+    for stage in STAGES:
+        summary = pd.DataFrame(metrics[stage]).T[["precision", "recall", "f1", "roc_auc"]]
+        print(f"\nTest set, {stage} (threshold 0.5):")
+        print(summary.astype(float).round(4).to_string())
 
 
 if __name__ == "__main__":
