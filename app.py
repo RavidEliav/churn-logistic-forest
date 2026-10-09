@@ -1,0 +1,210 @@
+import json
+from pathlib import Path
+
+import joblib
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+
+BASE_DIR = Path(__file__).parent
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+DATA_PATH = BASE_DIR / "churn_modelling.csv"
+
+st.set_page_config(page_title="Churn Model Comparison", layout="wide")
+
+
+@st.cache_data
+def load_artifacts():
+    metrics = json.loads((ARTIFACTS_DIR / "metrics.json").read_text())
+    predictions = pd.read_csv(ARTIFACTS_DIR / "test_predictions.csv")
+    weights = pd.read_csv(ARTIFACTS_DIR / "feature_importance.csv")
+    return metrics, predictions, weights
+
+
+@st.cache_resource
+def load_model(file_name: str):
+    return joblib.load(ARTIFACTS_DIR / file_name)
+
+
+@st.cache_data
+def load_data():
+    return pd.read_csv(DATA_PATH)
+
+
+if not (ARTIFACTS_DIR / "metrics.json").exists():
+    # Artifacts are not committed (RF models are ~55 MB each), so cloud deploys train on first launch
+    import train
+
+    with st.spinner("Training models for the first time..."):
+        train.main()
+
+metrics, predictions, weights = load_artifacts()
+model_names = list(metrics)
+y_true = predictions["y_true"]
+
+st.sidebar.header("Settings")
+selected = st.sidebar.multiselect("Models", model_names, default=model_names)
+threshold = st.sidebar.slider("Decision threshold", 0.05, 0.95, 0.5, 0.05)
+st.sidebar.caption(
+    f"Test set: {len(y_true):,} customers, churn rate {y_true.mean():.1%}"
+)
+
+st.title("Customer Churn: Logistic Regression vs Random Forest")
+
+if not selected:
+    st.warning("Select at least one model in the sidebar.")
+    st.stop()
+
+
+def threshold_metrics(name: str) -> dict:
+    proba = predictions[name]
+    pred = (proba >= threshold).astype(int)
+    return {
+        "Precision": precision_score(y_true, pred, zero_division=0),
+        "Recall": recall_score(y_true, pred),
+        "F1 Score": f1_score(y_true, pred),
+        "ROC AUC": roc_auc_score(y_true, proba),
+    }
+
+
+summary = pd.DataFrame({name: threshold_metrics(name) for name in selected}).T
+
+tabs = st.tabs(
+    [
+        "Metrics Overview",
+        "ROC Curves",
+        "Precision-Recall",
+        "Confusion Matrices",
+        "Feature Importance",
+        "Predict Customer",
+    ]
+)
+
+with tabs[0]:
+    st.subheader(f"Metrics at threshold {threshold:.2f}")
+    cols = st.columns(len(summary.columns))
+    for col, metric in zip(cols, summary.columns):
+        best = summary[metric].idxmax()
+        col.metric(f"Best {metric}", f"{summary.loc[best, metric]:.3f}", best,
+                   delta_color="off")
+
+    st.dataframe(
+        summary.style.format("{:.4f}").highlight_max(axis=0, color="#2e7d32"),
+        width="stretch",
+    )
+
+    long = summary.reset_index(names="Model").melt(
+        id_vars="Model", var_name="Metric", value_name="Score"
+    )
+    fig = px.bar(long, x="Metric", y="Score", color="Model", barmode="group",
+                 text_auto=".3f", range_y=[0, 1])
+    st.plotly_chart(fig, width="stretch")
+    st.caption("ROC AUC is threshold-independent; the other metrics change with the slider.")
+
+with tabs[1]:
+    fig = go.Figure()
+    for name in selected:
+        fpr, tpr, _ = roc_curve(y_true, predictions[name])
+        auc = roc_auc_score(y_true, predictions[name])
+        fig.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines",
+                                 name=f"{name} (AUC={auc:.3f})"))
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random",
+                             line=dict(dash="dash", color="gray")))
+    fig.update_layout(xaxis_title="False Positive Rate",
+                      yaxis_title="True Positive Rate", height=550)
+    st.plotly_chart(fig, width="stretch")
+
+with tabs[2]:
+    fig = go.Figure()
+    for name in selected:
+        prec, rec, _ = precision_recall_curve(y_true, predictions[name])
+        ap = average_precision_score(y_true, predictions[name])
+        fig.add_trace(go.Scatter(x=rec, y=prec, mode="lines",
+                                 name=f"{name} (AP={ap:.3f})"))
+    fig.add_hline(y=y_true.mean(), line_dash="dash", line_color="gray",
+                  annotation_text="Baseline (churn rate)")
+    fig.update_layout(xaxis_title="Recall", yaxis_title="Precision", height=550)
+    st.plotly_chart(fig, width="stretch")
+
+with tabs[3]:
+    st.subheader(f"Confusion matrices at threshold {threshold:.2f}")
+    cols = st.columns(2)
+    labels = ["Stayed (0)", "Churned (1)"]
+    for i, name in enumerate(selected):
+        pred = (predictions[name] >= threshold).astype(int)
+        cm = confusion_matrix(y_true, pred)
+        fig = px.imshow(cm, x=labels, y=labels, text_auto=True,
+                        color_continuous_scale="Blues",
+                        labels=dict(x="Predicted", y="Actual", color="Count"))
+        fig.update_layout(title=name, coloraxis_showscale=False, height=380)
+        cols[i % 2].plotly_chart(fig, width="stretch")
+
+with tabs[4]:
+    top_n = st.slider("Top features", 5, 13, 13)
+    cols = st.columns(2)
+    for i, name in enumerate(selected):
+        w = weights[weights["model"] == name].copy()
+        kind = w["kind"].iloc[0]
+        w["feature"] = w["feature"].str.replace(r"^(num|cat)__", "", regex=True)
+        w = w.reindex(w["value"].abs().sort_values().index).tail(top_n)
+        fig = px.bar(w, x="value", y="feature", orientation="h",
+                     color="value", color_continuous_scale="RdBu",
+                     color_continuous_midpoint=0 if kind == "coefficient" else None)
+        fig.update_layout(title=f"{name} - {kind}", height=450,
+                          coloraxis_showscale=False, yaxis_title=None)
+        cols[i % 2].plotly_chart(fig, width="stretch")
+    st.caption("Logistic Regression coefficients are on standardized features; "
+               "positive values increase churn probability.")
+
+with tabs[5]:
+    data = load_data()
+    with st.form("predict"):
+        c1, c2, c3 = st.columns(3)
+        customer = {
+            "CreditScore": c1.number_input("Credit score", 300, 900, 650),
+            "Geography": c1.selectbox("Geography", sorted(data["Geography"].unique())),
+            "Gender": c1.selectbox("Gender", sorted(data["Gender"].unique())),
+            "Age": c2.number_input("Age", 18, 100, 40),
+            "Tenure": c2.number_input("Tenure (years)", 0, 10, 5),
+            "Balance": c2.number_input("Balance", 0.0, 300000.0, 75000.0, 1000.0),
+            "NumOfProducts": c3.number_input("Number of products", 1, 4, 1),
+            "HasCrCard": int(c3.checkbox("Has credit card", True)),
+            "IsActiveMember": int(c3.checkbox("Active member", True)),
+            "EstimatedSalary": c3.number_input("Estimated salary", 0.0, 250000.0,
+                                               100000.0, 1000.0),
+        }
+        submitted = st.form_submit_button("Predict churn")
+
+    if submitted:
+        row = pd.DataFrame([customer])
+        results = pd.DataFrame(
+            {
+                "Model": selected,
+                "Churn probability": [
+                    load_model(metrics[n]["file"]).predict_proba(row)[0, 1]
+                    for n in selected
+                ],
+            }
+        )
+        results["Prediction"] = results["Churn probability"].map(
+            lambda p: "Churn" if p >= threshold else "Stay"
+        )
+        fig = px.bar(results, x="Model", y="Churn probability", color="Prediction",
+                     text_auto=".1%", range_y=[0, 1],
+                     color_discrete_map={"Churn": "#d62728", "Stay": "#2ca02c"})
+        fig.add_hline(y=threshold, line_dash="dash",
+                      annotation_text=f"Threshold {threshold:.2f}")
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(results.style.format({"Churn probability": "{:.1%}"}),
+                     width="stretch", hide_index=True)
