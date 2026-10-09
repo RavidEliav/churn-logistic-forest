@@ -253,7 +253,3 @@ if __name__ == "__main__":
     parser.add_argument("--no-tune", action="store_true",
                         help="reuse tuning/best_params.json instead of running the grid search")
     main(tune=not parser.parse_args().no_tune)
-
-
-if __name__ == "__main__":
-    main()
