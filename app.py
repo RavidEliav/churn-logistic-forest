@@ -44,17 +44,27 @@ def load_data():
     return pd.read_csv(DATA_PATH)
 
 
+@st.cache_data
+def load_tuning():
+    return train.saved_params(), pd.read_csv(train.CV_RESULTS_PATH)
+
+
 def artifacts_are_current() -> bool:
     metrics_path = ARTIFACTS_DIR / "metrics.json"
-    if not metrics_path.exists():
+    tuned = train.saved_params()
+    if not metrics_path.exists() or tuned is None:
         return False
-    return set(json.loads(metrics_path.read_text())) == set(train.build_models())
+    saved = json.loads(metrics_path.read_text())
+    return set(saved) == set(tuned) and all(
+        saved[name].get("params") == tuned[name]["params"] for name in tuned
+    )
 
 
-# Artifacts are not committed (RF models are ~55 MB each), so deploys train on first launch
+# Artifacts are not committed (RF models are large); tuned params in tuning/ are, so deploys
+# refit the best models quickly instead of re-running the grid search
 if not artifacts_are_current():
     with st.spinner("Training models..."):
-        train.main()
+        train.main(tune=train.saved_params() is None)
     st.cache_data.clear()
     st.cache_resource.clear()
 
@@ -96,6 +106,7 @@ tabs = st.tabs(
         "Precision-Recall",
         "Confusion Matrices",
         "Feature Importance",
+        "Cross-Validation",
         "Predict Customer",
     ]
 )
@@ -178,6 +189,72 @@ with tabs[4]:
                "Random Forest and Gradient Boosting show impurity-based importances.")
 
 with tabs[5]:
+    tuned, cv_results = load_tuning()
+    st.subheader(f"GridSearchCV with {train.CV_FOLDS}-fold stratified cross-validation")
+    st.caption(f"Run on the 80% training set only; best parameters chosen by mean CV "
+               f"{train.REFIT_METRIC.upper().replace('_', ' ')}, then refit on the full "
+               f"training set and evaluated on the held-out test set.")
+
+    metric_labels = {"precision": "Precision", "recall": "Recall", "f1": "F1 Score",
+                     "roc_auc": "ROC AUC"}
+    rows = []
+    for name in selected:
+        row = {"Model": name,
+               "Best parameters": ", ".join(
+                   f"{k.removeprefix('clf__')}={v}"
+                   for k, v in tuned[name]["params"].items()),
+               "Combinations": int((cv_results["model"] == name).sum())}
+        for key, label in metric_labels.items():
+            cv = tuned[name]["cv"][key]
+            row[f"CV {label}"] = f"{cv['mean']:.3f} ± {cv['std']:.3f}"
+        row["Test ROC AUC"] = f"{metrics[name]['roc_auc']:.3f}"
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    cv_long = pd.DataFrame(
+        [{"Model": name, "Metric": label, "Mean": tuned[name]["cv"][key]["mean"],
+          "Std": tuned[name]["cv"][key]["std"]}
+         for name in selected for key, label in metric_labels.items()]
+    )
+    fig = px.bar(cv_long, x="Metric", y="Mean", color="Model", barmode="group",
+                 error_y="Std", range_y=[0, 1],
+                 title="Mean CV score ± std (best parameters, threshold 0.5)")
+    st.plotly_chart(fig, width="stretch")
+
+    c1, c2 = st.columns(2)
+    fold_metric = c1.selectbox("Per-fold metric", list(metric_labels),
+                               format_func=metric_labels.get,
+                               index=list(metric_labels).index(train.REFIT_METRIC))
+    folds = pd.DataFrame(
+        [{"Model": name, "Fold": k + 1, "Score": score}
+         for name in selected
+         for k, score in enumerate(tuned[name]["cv"][fold_metric]["folds"])]
+    )
+    fig = px.box(folds, x="Model", y="Score", color="Model", points="all",
+                 title=f"{metric_labels[fold_metric]} per fold")
+    fig.update_layout(showlegend=False, xaxis_title=None)
+    c1.plotly_chart(fig, width="stretch")
+
+    gap = pd.DataFrame(
+        [{"Model": name, "Set": s, "ROC AUC": v}
+         for name in selected
+         for s, v in [("CV (train)", tuned[name]["cv"]["roc_auc"]["mean"]),
+                      ("Test", metrics[name]["roc_auc"])]]
+    )
+    fig = px.bar(gap, x="Model", y="ROC AUC", color="Set", barmode="group",
+                 text_auto=".3f", range_y=[0.5, 1], title="CV vs test ROC AUC")
+    fig.update_layout(xaxis_title=None)
+    c2.plotly_chart(fig, width="stretch")
+
+    with st.expander("All grid search combinations"):
+        grid_model = st.selectbox("Model", selected, key="grid_model")
+        grid = cv_results[cv_results["model"] == grid_model].sort_values("rank")
+        grid = grid.assign(params=grid["params"].str.replace("clf__", ""))
+        cols = ["rank", "params"] + [f"mean_{m}" for m in metric_labels] + ["fit_time"]
+        st.dataframe(grid[cols].style.format(precision=4), width="stretch",
+                     hide_index=True)
+
+with tabs[6]:
     data = load_data()
     with st.form("predict"):
         c1, c2, c3 = st.columns(3)
