@@ -17,6 +17,8 @@ from sklearn.metrics import (
     roc_curve,
 )
 
+import train
+
 BASE_DIR = Path(__file__).parent
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
 DATA_PATH = BASE_DIR / "churn_modelling.csv"
@@ -42,12 +44,19 @@ def load_data():
     return pd.read_csv(DATA_PATH)
 
 
-if not (ARTIFACTS_DIR / "metrics.json").exists():
-    # Artifacts are not committed (RF models are ~55 MB each), so cloud deploys train on first launch
-    import train
+def artifacts_are_current() -> bool:
+    metrics_path = ARTIFACTS_DIR / "metrics.json"
+    if not metrics_path.exists():
+        return False
+    return set(json.loads(metrics_path.read_text())) == set(train.build_models())
 
-    with st.spinner("Training models for the first time..."):
+
+# Artifacts are not committed (RF models are ~55 MB each), so deploys train on first launch
+if not artifacts_are_current():
+    with st.spinner("Training models..."):
         train.main()
+    st.cache_data.clear()
+    st.cache_resource.clear()
 
 metrics, predictions, weights = load_artifacts()
 model_names = list(metrics)
@@ -60,7 +69,7 @@ st.sidebar.caption(
     f"Test set: {len(y_true):,} customers, churn rate {y_true.mean():.1%}"
 )
 
-st.title("Customer Churn: Logistic Regression vs Random Forest")
+st.title("Customer Churn: Logistic Regression vs Random Forest vs Gradient Boosting")
 
 if not selected:
     st.warning("Select at least one model in the sidebar.")
@@ -165,7 +174,8 @@ with tabs[4]:
                           coloraxis_showscale=False, yaxis_title=None)
         cols[i % 2].plotly_chart(fig, width="stretch")
     st.caption("Logistic Regression coefficients are on standardized features; "
-               "positive values increase churn probability.")
+               "positive values increase churn probability. "
+               "Random Forest and Gradient Boosting show impurity-based importances.")
 
 with tabs[5]:
     data = load_data()

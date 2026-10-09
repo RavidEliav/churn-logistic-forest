@@ -4,7 +4,7 @@ from pathlib import Path
 import joblib
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     confusion_matrix,
@@ -16,6 +16,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
 
 BASE_DIR = Path(__file__).parent
 DATA_PATH = BASE_DIR / "churn_modelling.csv"
@@ -34,6 +35,8 @@ NUMERIC = [
     "EstimatedSalary",
 ]
 RANDOM_STATE = 42
+# GradientBoostingClassifier has no class_weight, so these are balanced via fit sample weights
+SAMPLE_WEIGHTED = {"Gradient Boosting (balanced)"}
 
 
 def build_preprocessor() -> ColumnTransformer:
@@ -60,6 +63,10 @@ def build_models() -> dict[str, Pipeline]:
             random_state=RANDOM_STATE,
             n_jobs=-1,
             class_weight="balanced",
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(random_state=RANDOM_STATE),
+        "Gradient Boosting (balanced)": GradientBoostingClassifier(
+            random_state=RANDOM_STATE
         ),
     }
     return {
@@ -98,7 +105,10 @@ def main() -> None:
     metrics, weights = {}, []
 
     for name, pipe in build_models().items():
-        pipe.fit(X_train, y_train)
+        fit_params = {}
+        if name in SAMPLE_WEIGHTED:
+            fit_params["clf__sample_weight"] = compute_sample_weight("balanced", y_train)
+        pipe.fit(X_train, y_train, **fit_params)
         proba = pipe.predict_proba(X_test)[:, 1]
         pred = (proba >= 0.5).astype(int)
 
