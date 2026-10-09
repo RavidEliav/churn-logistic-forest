@@ -60,8 +60,7 @@ def artifacts_are_current() -> bool:
     )
 
 
-# Artifacts are not committed (RF models are large); tuned params in tuning/ are, so deploys
-# refit the best models quickly instead of re-running the grid search
+# Fitted models aren't in git but tuned params are, so deploys refit without re-running the search
 if not artifacts_are_current():
     with st.spinner("Training models..."):
         train.main(tune=train.saved_params() is None)
